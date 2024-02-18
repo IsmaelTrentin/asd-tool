@@ -1,6 +1,12 @@
 use clap::Parser;
+use colored::Colorize;
+use error::CliError;
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::process::Command;
+
+pub mod error;
 
 #[derive(Parser)]
 struct CliArgs {
@@ -34,73 +40,38 @@ fn size_to_human_readable(size: u32) -> String {
     format!("{:.1} {}", value, label)
 }
 
-fn process_node(node_path: &str, args: &CliArgs) -> (Vec<String>, Vec<u64>) {
-    if let Ok(meta) = fs::metadata(node_path) {
-        if meta.is_dir() == false {
-            panic!("node_path must be a folder");
-        }
-    } else {
-        panic!("path does not exist or is inaccessible");
-    }
+fn get_asd_files_paths(root_dir: &str) -> Result<Vec<String>, std::io::Error> {
+    let output;
 
-    // println!("processing node {node_path}");
+    if cfg!(target_os = "windows") {
+        return Err(std::io::Error::new(
+            io::ErrorKind::Unsupported,
+            CliError::UnsupportedOS,
+        ));
+    } // else
+    output = Command::new("find")
+        .arg(root_dir)
+        .arg("-name")
+        .arg("*.asd")
+        .output()?;
 
-    let mut asd_files: Vec<String> = Vec::with_capacity(10);
-    let mut asd_sizes: Vec<u64> = Vec::with_capacity(10);
-
-    let entries = fs::read_dir(node_path).expect("could not read {path}");
-    for entry_result in entries {
-        if let Ok(entry) = entry_result {
-            let f_type = entry.file_type().unwrap();
-            let path = entry.path().to_str().unwrap().to_string();
-
-            if f_type.is_dir() {
-                // println!("processing node {path}");
-                // recurse
-                let (files, sizes) = process_node(&path, args);
-
-                if files.len() > 0 && !args.no_list {
-                    println!(
-                        "found\t{}\t({})\t{}",
-                        files.len(),
-                        size_to_human_readable(sizes.iter().sum::<u64>() as u32),
-                        path.replace(&args.root_node, "")
-                    );
-                }
-
-                asd_files.extend(files);
-                asd_sizes.extend(sizes);
-                continue;
-            }
-
-            if !path.ends_with(".asd") {
-                continue;
-            }
-
-            // now is file and is a .asd file
-            asd_files.push(path.clone());
-            if let Ok(metadata) = entry.metadata() {
-                asd_sizes.push(metadata.len());
-                // print!("{}B\n", metadata.len());
-            } else {
-                asd_sizes.push(0);
-                print!("failed to get size\n");
-            }
-
-            // delete asd
-            if args.purge && !args.dry_run {
-                match fs::remove_file(&path) {
-                    Ok(_) => println!("removed {}", &path),
-                    Err(err) => eprintln!("{err}"),
-                }
-            }
+    if let Some(exit_code) = output.status.code() {
+        if exit_code != 0 {
+            return Err(std::io::Error::new(
+                io::ErrorKind::Other,
+                String::from_utf8(output.stderr).unwrap_or("find command failed".to_owned()),
+            ));
         }
     }
 
-    (asd_files, asd_sizes)
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| std::io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let lines = stdout.lines().map(|l| l.to_owned()).collect();
+
+    Ok(lines)
 }
 
-fn main() {
+fn main() -> Result<(), CliError> {
     let args = CliArgs::parse();
 
     if args.force {
@@ -126,22 +97,44 @@ fn main() {
     }
 
     println!("root dir: {}", &args.root_node);
-    let (files, sizes) = process_node(&args.root_node, &args);
+
+    let files = get_asd_files_paths(&args.root_node)?;
+    let mut sizes = Vec::with_capacity(files.len());
+
+    for file in files {
+        if let Ok(meta) = fs::metadata(&file) {
+            sizes.push(meta.size());
+        } else {
+            println!("{} {}", "could not read metadata for:".red(), file.cyan());
+        }
+
+        println!(
+            "({})\t{}",
+            size_to_human_readable(sizes[sizes.len() - 1] as u32),
+            file.replace(&args.root_node, "")
+        );
+    }
+
+    // let (files, sizes) = process_node(&args.root_node, &args);
 
     let total_size_bytes = sizes.iter().sum::<u64>();
 
     println!();
-    println!("total asd files: {}", files.len());
+    println!("total asd files: {}", sizes.len());
     println!(
         "total asd files size: {}",
         size_to_human_readable(total_size_bytes as u32)
     );
 
-    if args.dry_run {
-        println!();
-        println!("files that would be removed:");
-        for f in files {
-            println!("{f}");
-        }
-    }
+    todo!("implement purge and dry-run");
+
+    // if args.dry_run {
+    //     println!();
+    //     println!("files that would be removed:");
+    //     for f in files {
+    //         println!("{f}");
+    //     }
+    // }
+
+    Ok(())
 }
